@@ -1,237 +1,221 @@
 # Frontistirio — Announcements Brain
 
-> **Full-stack reference** for the announcements feature: a store-user composes an **announcement**, picks an **audience** (teachers / students / parents, with **grade + class filters** exactly like the email feature), and sends it **now** or **schedules** it for later. The audience is **snapshotted to user accounts at send time**, and the announcement is designed to be delivered as a **native push notification** to the mobile apps. Spans **Frontistirio-API** (Node/Express/MongoDB) and **Frontistirio** (Angular/Ionic/NgRx). Closely mirrors the [email-services](https://github.com/KiziridisK/Frontistirio-email-services-brain-repo) feature.
+> **Full-stack reference** for the announcements feature: a store-user composes an **announcement**, picks an **audience** (teachers / students / parents, with **grade + class filters** exactly like the email feature), and sends it **now** or **schedules** it for later. The audience is **snapshotted to user accounts at send time** and delivered as a **native push notification** (Capacitor + Firebase/FCM) to the mobile app. Spans **Frontistirio-API** (Node/Express/MongoDB) and **Frontistirio** (Angular/Ionic/NgRx/Capacitor). Closely mirrors the [email-services](https://github.com/KiziridisK/Frontistirio-email-services-brain-repo) feature.
+
+> For the **build/emulator/Firebase setup procedure** (how the APK is built, how to run the Android emulator, how Firebase push was wired + every gotcha we hit), see the companion runbook: [Frontistirio-android-build-firebase-brain-repo](https://github.com/KiziridisK/Frontistirio-android-build-firebase-brain-repo).
+
+---
+
+## Status (2026-07-02)
+
+| Piece | State |
+|---|---|
+| Phase 1 — CRUD + audience targeting + live list | ✅ done (2026-06-30) |
+| Phase 2 — native push (device registry, FCM dispatch, Capacitor) | ✅ done + **tested E2E on Android emulator** (2026-07-02) |
+| Student recipient inbox (home preview + full page) | ✅ done (2026-07-02) — *revised the original "no inbox" decision, for the student role* |
+| iOS push | ⏳ pending (needs a Mac + Apple Developer + APNs key) |
+| Production hardening (androidScheme back to https, etc.) | ⏳ see [Next steps](#next-steps--εκκρεμότητες) |
 
 ---
 
 ## Scope & product decisions
 
-Agreed up front with the user (these shape everything below):
-
 | Decision | Choice | Consequence |
 |---|---|---|
-| **Delivery channel** | **Native push** (Capacitor + FCM/APNs) | No push infra exists yet (no Capacitor in the frontend, no `firebase-admin` in the backend) — it is added from scratch, in later phases. |
-| **Recipient inbox / read-tracking** | **No** | Send + notify only. No recipient-facing "my announcements" page, no read/unread status. The per-recipient record only tracks *delivery* status. |
-| **Audience storage** | **Snapshot of resolved `user_id`s at send time** | Same as email: the audience is "frozen". Later enrollment changes do not retroactively change who an already-sent announcement targeted. |
-
-### Why a phased build
-
-The feature is large and the push half needs **external setup the user must do** (a Firebase project, an Apple Developer account + APNs key, a service-account key). So it was split:
-
-- **Phase 1 — DONE (2026-06-30):** full CRUD + audience targeting + live list. **No push yet.**
-- **Phase 2 — pending (code):** device-token registry, `/devices` routes, `push.service.ts`, `pushDispatcher`, Capacitor scaffolding, `firebase-admin`.
-- **Phase 3 — pending (external + wiring):** create the Firebase/APNs assets, drop them in, test end-to-end.
+| **Delivery channel** | **Native push** (Capacitor + FCM/APNs) | Added from scratch — no Capacitor/firebase-admin existed before. Android works end-to-end; iOS pending. |
+| **Recipient inbox / read-tracking** | Originally **no**; **revised 2026-07-02** to add a **student** inbox (view only). | Students see their announcements (home preview + `/my-announcements`). **Still no read/unread tracking.** Endpoint is any-role, so parent/teacher inboxes are a trivial extension. |
+| **Audience storage** | **Snapshot of resolved `user_id`s at send time** | Same as email: the audience is "frozen". Later enrollment changes don't retroactively change who an already-sent announcement targeted. |
 
 ---
 
 ## Change log
 
+### 2026-07-02 — Phase 2: native push (Android E2E ✅) + student inbox
+
+**Push plumbing (backend):**
+- `models/deviceToken.js` — FCM token registry (one doc per device).
+- `routes/devices.js` + `controllers/devices.js` + `controllers/handlers/devices.js` — `POST /devices/register` & `/unregister` (auth, **any role**).
+- `services/firebaseAdmin.js` — lazy, **defensive** `firebase-admin` wrapper (server boots even without the package/creds → push just disabled).
+- `services/pushDispatcher.js` — `sendToUsers(userIds, payload)` → `sendEachForMulticast`, aggregates per-user, prunes dead tokens.
+- `services/announcementDispatcher.js` — **the Phase-1 stub is now real**: calls `pushDispatcher`; if push isn't configured it falls back to marking `sent` (dev-safe).
+- `scripts/sendTestPush.js` — send a test push to a raw token (isolates "are the creds working?").
+- `index.js` — mounts `/devices`. `package.json` — added `firebase-admin ^13`.
+
+**Push plumbing (frontend):**
+- Installed `@capacitor/{core,cli,android,ios,push-notifications}@6` (Capacitor 6 pairs with Ionic 8). `capacitor.config.ts`, `npx cap add android`.
+- `services/devices.service.ts` (POST /devices/register,/unregister), `services/push.service.ts` (native-only: permission → register → send token; foreground toast; tap → `/home`; unregister on logout).
+- Wired in `app.component.ts`: `pushService.init()` after `webSocketService.connect()`; `pushService.unregister()` in `logout()`. JWT auto-attached by the existing `auth.interceptor.ts`.
+
+**Bug fixed — `CastError: … "[object Object]" … path "_id" for model "User"`:** the bootstrap **populates** `student.user_id`, so the compose screen was sending the whole populated `User` object (incl. `passwordHash`!) as `userId`. `String(obj)` → `"[object Object]"` → `$in` cast blew up. Fixed **both sides**: backend `resolveRecipients` added an `idOf(v)` normalizer (string | `{_id}` object → string id) used for `userId`/`studentId`/`teacherId`; frontend `select-recipients` now sends a clean string id via the existing `extractId()`. *(Separate finding: the bootstrap leaking `passwordHash` to the client is a real security bug — flagged for its own fix.)*
+
+**Student inbox:**
+- Backend `GET /announcements/my-announcements` (auth, any role) → `getUserAnnouncements(userId)`: `{ "recipients.user": userId, isDeleted:false, status ∉ [scheduled,canceled] }` with a **projection that omits the recipients array** (a recipient never sees who else got it).
+- Frontend: `AnnouncementsService.getMyAnnouncements()`, reuses the `announcements` NgRx slice. New standalone `MyAnnouncementItemComponent` (read-only card, `compact` input) + `MyAnnouncementsComponent` page at `/my-announcements` (`RoleGuard ['student']`). Home preview: `home.page.ts` loads for students → top-3 rows in the student branch of `home.page.html` (`.announcements-preview-card`, styled in `home.page.scss`). i18n `announcements.{my_announcements,latest,view_all}`.
+- Students get their data via **HTTP fetch** (not socket) — live in-app delivery to recipients would need a *sanitized* socket event (recipients array must stay hidden); real-time to students = the FCM push.
+
+**Config / infra learnings (see the runbook repo for the full procedure):**
+- `angular.json` — bumped `anyComponentStyle` budget `8kb → 16kb` (home.page.scss was already ~10.6 kB compiled; prod build enforces budgets, dev builds don't).
+- `capacitor.config.ts` — set `server.androidScheme: 'http'` so the WebView (served from `http://localhost`) can call the local **http** backend without **mixed-content** blocking. *(Revert to `https` for production.)*
+- `index.js` CORS — added `http://localhost`, `https://localhost`, `capacitor://localhost` (the native WebView origin) to both the express `allowedOrigins` and the socket.io `cors.origin`.
+- Android `usesCleartextTraffic="true"` (main + debug manifest) so plain-http dev calls aren't blocked.
+- `environment.ts` — for emulator builds use `http://10.0.2.2:3000` (emulator alias for the host); revert to `http://localhost:3000` for browser dev.
+
+**Verification:** backend `node --check` clean; `ng build` (dev + prod) passes; `firebaseAdmin.isConfigured()` → true with the service account; **full E2E confirmed**: store-user sends → student's emulator receives the push (foreground toast + background tray).
+
 ### 2026-06-30 — Phase 1: CRUD + audience targeting (no push)
-
-Built the whole core feature end-to-end by mirroring the email subsystem across both repos.
-
-- New **Announcement** model (recipients snapshot, rollup status/counts, soft-delete, scheduling).
-- **Audience resolution is server-side**: the compose screen sends selected entity ids + roles; the backend resolves them to `user_id`s and **re-validates** that every account belongs to the store (no cross-tenant targeting).
-- Send **now** or **schedule** for later; **cancel** a still-scheduled announcement.
-- Live `/announcements` list via the existing Socket.IO + NgRx pipeline (`announcementAdded/Updated/Deleted`).
-- Reused the existing **`SelectRecipientsComponent`** by adding a 3rd `mode: 'announcement'` that selects by **account presence** instead of email, and carries entity/user ids.
-- Home card under **Communication**, route `/announcements` (+ `/add`, `/:id`), i18n `announcements.*` in el + en.
-
-**Verification:** backend `node --check` on every new/edited file = clean; frontend `ng build` (dev) succeeds (only pre-existing warnings, none related to announcements); i18n JSON validated.
-
-> ⚠️ **Phase-1 honesty note:** with no push channel yet, "sending" only persists the announcement and broadcasts it to store-users over the socket. `services/announcementDispatcher.js` is a **stub** that marks every pending recipient `sent`. Phase 2 swaps the stub body for a real FCM push that sets `sent`/`failed` from the actual result — **the controller and scheduler do not change.**
+Built the core feature by mirroring the email subsystem: Announcement model (recipients snapshot, rollup status/counts, soft-delete, scheduling), server-side audience resolution + cross-tenant re-validation, send-now/schedule/cancel, live `/announcements` list (Socket.IO + NgRx), reused `SelectRecipientsComponent` (new `mode:'announcement'`), home card, routes, i18n. The dispatcher was a **stub** (marked recipients `sent` without a real push) — replaced in Phase 2.
 
 ---
 
 ## Architecture overview
 
 ```
-COMPOSE (frontend) ──POST /announcements/send (JSON)──► Express
-   │                                                     │
+COMPOSE (store-user) ──POST /announcements/send (JSON)──► Express
    │                          resolveRecipients(): entity ids → user_ids,
    │                          re-validated against the store (no cross-tenant)
-   │                                                     │
    │                          create Announcement doc (status=sending|scheduled)
-   │                                                     │
-   │            immediate ─────► dispatchAnnouncement() ◄───── scheduled
-   │                                    │                 (jobs/announcementScheduler.js, 60s tick)
-   │                          PHASE 1: mark pending recipients → "sent" (STUB)
-   │                          PHASE 2: push via FCM, set "sent"/"failed" per device result
+   │            immediate ─────► dispatchAnnouncement() ◄───── scheduled (announcementScheduler, 60s)
    │                                    │
-   │                          doc.save() → MongoDB change stream
+   │                          pushDispatcher.sendToUsers(userIds, {title, body, data})
+   │                                    │   look up DeviceToken(s) per user
    │                                    ▼
-   └──────── socket "announcementAdded"/"announcementUpdated" ◄──┘ (watchAnnouncements)
+   │                          firebase-admin → FCM → 📱 Android (direct) / iOS (via APNs)
+   │                                    │   per-user result → recipient.status = sent|failed
+   │                          doc.save() → change stream → socket "announcementUpdated"
+   │
+DEVICE REGISTRATION (any role, on native app login):
+   push.service.ts ──FCM token──► POST /devices/register ──► DeviceToken collection
 
-
-PHASE 2 device registration (every role, on native app login):
-  push.service.ts ──register FCM token──► POST /devices/register ──► DeviceToken collection
+STUDENT INBOX (HTTP): home preview + /my-announcements ──GET /announcements/my-announcements──► (sanitized, no recipients[])
 ```
 
-**Key design decision — resolve the audience on the server.** The frontend may already hold a `user_id` for students/parents, but **not for teachers** (the frontend `Teacher` model has no `user_id`). Rather than depend on what the bootstrap payload happens to include, the compose screen sends whatever identifies each pick (`userId` *or* an entity id), and the backend resolves + **re-validates** every account against the store. This is robust *and* closes the cross-tenant gap.
+**Two key design decisions:**
+1. **Resolve the audience on the server.** The frontend may hold a `user_id` for students/parents but **not for teachers**. The compose screen sends whatever identifies each pick (`userId` *or* an entity id) and the backend resolves + **re-validates** every account against the store.
+2. **`sendEachForMulticast` per blast, aggregated per user.** One FCM call per ≤500 tokens; the result is folded back per `user_id` so each recipient sub-doc gets `sent`/`failed`; tokens that come back `registration-token-not-registered` are deleted.
 
 ---
 
 ## Status lifecycle
 
-**Per-recipient** (`announcement.recipients[].status`) → drives the colored pills on the detail page:
+**Per-recipient** (`announcement.recipients[].status`):
 
 | status | colour | meaning |
 |---|---|---|
-| `pending` | 🟠 orange | created, not pushed yet (e.g. still scheduled, or Phase 1 before the stub runs) |
-| `sent` | 🟢 green | push handed off to FCM successfully *(Phase 1 stub sets this directly)* |
-| `failed` | 🔴 red | push send failed *(Phase 2)* |
-| `canceled` | ⚪ grey | scheduled send canceled before it left |
+| `pending` | 🟠 | created, not pushed yet (e.g. still scheduled) |
+| `sent` | 🟢 | push handed off to FCM OK (or push not configured → dev fallback) |
+| `failed` | 🔴 | every device failed **or** the user has no registered device (`no_device`) |
+| `canceled` | ⚪ | scheduled send canceled before it left |
 
-> Note vs. email: there is **no `delivered`/`bounced`** — FCM only tells us send success/failure, not end-device delivery. `sent` is therefore the terminal "success" state (green).
+> No `delivered`/`bounced` — FCM reports send success/failure, not end-device delivery. `sent` is the terminal success state.
 
-**Message rollup** (`announcement.status`), recomputed from recipients by `recomputeRollup()`:
-`scheduled` → `sending` (any still `pending`) → `sent` (all handed off) / `partially_failed` (some failed) / `failed` (all failed); or `canceled`.
+**Message rollup** (`announcement.status`), via `recomputeRollup()`: `scheduled` → `sending` (any `pending`) → `sent` / `partially_failed` / `failed`; or `canceled`.
 
 ---
 
-## Targeting / recipient resolution (the distinctive part)
+## Targeting / recipient resolution
 
-### What the frontend sends
-`POST /announcements/send` body (`recipients[]`), one entry per pick — see `AnnouncementRecipientInput`:
+**Frontend sends** (`recipients[]`, one per pick — `AnnouncementRecipientInput`):
 ```ts
-{ role: 'student'|'teacher'|'parent',
-  name?: string,
-  userId?: string,      // students & parents have it client-side
-  studentId?: string,   // student _id (also used to resolve a student's parent)
-  teacherId?: string,   // teacher _id (teacher has NO user_id client-side → resolved server-side)
-  parentKey?: 'father'|'mother' }
+{ role:'student'|'teacher'|'parent', name?, userId?, studentId?, teacherId?, parentKey?:'father'|'mother' }
 ```
+**Backend `resolveRecipients(raw, storeId)`:**
+1. `idOf(v)` normalizes every id (string **or** populated `{_id}` object → string) — guards against the bootstrap's populated `user_id`.
+2. Look up teacher/student entity ids that lack a `userId`: `Teacher.find(...).select('user_id')`; `Student.find(...).select('user_id parents').populate('parents.father'|'mother','user_id')`.
+3. Resolve each pick to a `user_id`; de-dupe.
+4. **Final guard:** `User.find({_id:{$in}, store: storeId, isDeleted:false})` — keep only accounts that exist **and** belong to this store (cross-tenant safety net).
 
-### How the backend resolves it — `resolveRecipients(rawRecipients, storeId)`
-1. Collect the entity ids that need a lookup (only where no `userId` was supplied).
-2. `Teacher.find({_id:{$in}, store_id, isDeleted:false}).select('user_id')` → `teacher _id → user_id`.
-3. `Student.find({_id:{$in}, store_id, isDeleted:false}).select('user_id parents').populate('parents.father','user_id').populate('parents.mother','user_id')` → `student _id → { self, father, mother }`.
-4. For each raw recipient, pick the `user_id` (direct, or via the maps), **de-dupe** by resolved id.
-5. **Final guard:** `User.find({_id:{$in}, store: storeId, isDeleted:false})` — keep only accounts that exist **and** belong to this store. This is the cross-tenant safety net.
-
-All three roles link to `User`: `Student.user_id`, `Teacher.user_id`, `Parent.user_id`. **The `Parent` model lives in `models/parent.js`** (its schema variable is confusingly named `gradesSchema`, but it `module.exports = mongoose.model("Parent", …)`).
+All three roles link to `User`: `Student.user_id`, `Teacher.user_id`, `Parent.user_id`. **The `Parent` model lives in `models/parent.js`** (schema var confusingly named `gradesSchema`, but exports model `"Parent"`).
 
 ---
 
 ## Backend (`Frontistirio-API`)
 
-### Model — `models/announcement.js` (`Announcement`)
-```javascript
-{
-  title: String (required), body: String,
+### Models
+- `models/announcement.js` (`Announcement`) — `title`, `body`, `recipients[{ user→User, name, role, status, error, lastEventAt }]`, `store`, `createdBy`, `mode`, `sendAt`, `sentAt`, `status`, `counts{total,pending,sent,failed}`, soft-delete, `recomputeRollup()`.
+- `models/deviceToken.js` (`DeviceToken`) — `{ user→User (indexed), token (unique), platform:'android'|'ios'|'web', store→Store, lastSeenAt }`, timestamps. Own collection (not an array on User) → multi-device + cheap stale-token cleanup.
 
-  recipients: [{                       // snapshot — one sub-doc per targeted account
-    user → User (required),
-    name, role: 'student'|'teacher'|'parent',
-    status: 'pending'|'sent'|'failed'|'canceled',
-    error, lastEventAt
-  }],
-
-  store → Store, createdBy → User,
-
-  mode: 'now'|'scheduled', sendAt: Date, sentAt: Date,
-  status: 'scheduled'|'sending'|'sent'|'partially_failed'|'failed'|'canceled',
-  counts: { total, pending, sent, failed },   // denormalized for list badges
-
-  isDeleted, deletedAt, updatedBy, timestamps: true
-}
-// method: recomputeRollup() → refresh counts + rollup status from recipients
-```
-
-### Routes — `routes/announcements.js`
-Plain `application/json` (no attachments, unlike emails), so the default `express.json()` parser handles them.
+### Routes
+`routes/announcements.js` (JSON; `express.json()`):
 
 | Method | Path | Middleware | Handler |
 |---|---|---|---|
 | POST | `/announcements/send` | auth, isStoreUser | `sendAnnouncement` |
 | GET | `/announcements/store-announcements` | auth, isStoreUser | `getStoreAnnouncements` |
+| GET | `/announcements/my-announcements` | **auth only (any role)** | `getMyAnnouncements` |
 | GET | `/announcements/get-announcement/:announcementId` | auth, isStoreUser | `getAnnouncement` |
 | POST | `/announcements/cancel` | auth, isStoreUser | `cancelScheduled` |
 
-> **Phase 2 will add** `routes/devices.js`: `POST /devices/register`, `POST /devices/unregister` — auth, **any role** (students/parents/teachers register their device tokens).
+`routes/devices.js` (auth only, any role): `POST /devices/register`, `POST /devices/unregister`.
 
-### Controller — `controllers/announcements.js`
-- `sendAnnouncement` — validate `title` + non-empty `recipients`; for scheduled, validate `sendAt` is a future date; `resolveRecipients()` (throws `no_valid_recipients` if nothing resolves); create the doc; if immediate → `dispatchAnnouncement`, else leave `scheduled`; re-read and return fresh.
-- `getStoreAnnouncements` / `getAnnouncement` — filter `isDeleted:false`.
-- `cancelScheduled` — 409 if it already started sending.
+### Controllers / handlers
+- `controllers/announcements.js` — `sendAnnouncement` (validate → `resolveRecipients` → create → immediate `dispatchAnnouncement` else `scheduled`), `getStoreAnnouncements`, `getMyAnnouncements`, `getAnnouncement`, `cancelScheduled` (409 if already sending).
+- `controllers/handlers/announcements.js` — `resolveRecipients` (+ `idOf`), `createAnnouncement`, `getStoreAnnouncements`, `getAnnouncement`, `getUserAnnouncements` (recipient inbox, projection omits `recipients`), `claimDueScheduledAnnouncement` (atomic scheduled→sending), `cancelScheduledAnnouncement`, `watchAnnouncements` (change-stream → socket; uses the **awaited** `emitToStoreUsers` — NOT the buggy non-awaited `filter`; see the [bugs brain repo](https://github.com/KiziridisK/Frontistirio-bugs-brain-repo)).
+- `controllers/devices.js` + `controllers/handlers/devices.js` — `registerDeviceToken` (upsert by token), `removeDeviceToken` (scoped by user), `getTokensForUsers`, `removeTokens`.
 
-### Handler (DB + change stream) — `controllers/handlers/announcements.js`
-- `resolveRecipients(raw, storeId)` — see [Targeting](#targeting--recipient-resolution-the-distinctive-part).
-- `createAnnouncement`, `getStoreAnnouncements`, `getAnnouncement`.
-- `claimDueScheduledAnnouncement()` — atomic `findOneAndUpdate` `scheduled→sending` (prevents double-send).
-- `cancelScheduledAnnouncement(id, userId)` — guarded `status:"scheduled"`; marks all recipients `canceled`, zeroes `counts.pending`.
-- `watchAnnouncements(io, userSockets)` — MongoDB change stream → socket `announcementAdded` / `announcementUpdated` (full doc as `changes`) / `announcementDeleted`. Uses `fullDocumentBeforeChange:"whenAvailable"` and an `on("error")` handler that logs + re-establishes after 5s.
-  - 🟢 **Emits via the AWAITED `emitToStoreUsers` helper** (same shape as `emails.js`) — i.e. it `await Promise.all(...)` the per-user `isStoreUser` checks before filtering. It deliberately does **NOT** use the buggy `Object.keys(userSockets).filter(async …)` pattern that leaks updates cross-tenant in the older watch handlers (see the [bugs brain repo](https://github.com/KiziridisK/Frontistirio-bugs-brain-repo)).
-
-### Service — `services/announcementDispatcher.js`
-`dispatchAnnouncement(doc)` — shared by immediate send + scheduler (mirrors `emailDispatcher`).
-- **Phase 1 (current):** for every `pending` recipient set `status='sent'`; stamp `sentAt`; `recomputeRollup`; `save()` (→ change stream → socket).
-- **Phase 2:** replace the per-recipient loop body with a call into `services/pushDispatcher.js` (look up the recipient's device tokens, `admin.messaging().sendEachForMulticast(...)`, set `sent`/`failed`, prune invalid tokens).
-
-### Background worker — `jobs/announcementScheduler.js`
-`startAnnouncementScheduler()` = dependency-free `setInterval` (60s). Each tick drains all due announcements via `claimDueScheduledAnnouncement()` (atomic) → `dispatchAnnouncement`. In-process only — move to BullMQ for multi-instance.
+### Services / jobs
+- `services/firebaseAdmin.js` — lazy singleton. Guarded `require('firebase-admin')` + credential loader supporting `FIREBASE_SERVICE_ACCOUNT` (JSON string), `FIREBASE_SERVICE_ACCOUNT_PATH` (abs or **relative to project root**), individual `FIREBASE_PROJECT_ID/CLIENT_EMAIL/PRIVATE_KEY`, or `GOOGLE_APPLICATION_CREDENTIALS`. `getMessaging()`/`isConfigured()`. Never crashes the server if unconfigured.
+- `services/pushDispatcher.js` — `sendToUsers(userIds, {title,body,data})` → `null` if unconfigured (caller falls back), else a `Map<userId,{successCount,failureCount,error}>`. Batches 500 tokens/call; prunes dead tokens.
+- `services/announcementDispatcher.js` — `dispatchAnnouncement(doc)`: `pushDispatcher.sendToUsers(...)` for pending recipients → set `sent`/`failed` (or dev-fallback `sent` when `null`); `sentAt`; `recomputeRollup`; `save`.
+- `jobs/announcementScheduler.js` — `setInterval` 60s; drains due via `claimDueScheduledAnnouncement` → `dispatchAnnouncement`. In-process only.
+- `scripts/sendTestPush.js` — `node scripts/sendTestPush.js <fcmToken> ["title"] ["body"]`.
 
 ### `index.js` wiring
-`require` + `app.use("/announcements", AnnouncementRoutes)`; `watchAnnouncements(io, userSockets)` (after `watchEmails`); `startAnnouncementScheduler()`.
+Mounts `/announcements` + `/devices`; `watchAnnouncements(io, userSockets)`; `startAnnouncementScheduler()`. CORS `allowedOrigins` + socket.io `cors.origin` include the native Capacitor origins.
 
-### Env vars
-**None for Phase 1.** Phase 3 adds the Firebase service-account (e.g. `GOOGLE_APPLICATION_CREDENTIALS` / `FIREBASE_*`) for `firebase-admin`.
+### Env vars (`.env`)
+```
+FIREBASE_SERVICE_ACCOUNT_PATH=serviceAccountKey.json   # simplest; file is .gitignored (secret!)
+# OR FIREBASE_SERVICE_ACCOUNT={…JSON one line…}  OR  FIREBASE_PROJECT_ID/CLIENT_EMAIL/PRIVATE_KEY
+```
+On boot with valid creds: `🔔 Firebase Admin initialized — push notifications enabled`. **nodemon does NOT watch `.env`** → restart manually after changing it.
 
 ---
 
 ## Frontend (`Frontistirio`)
 
-- **Model** `models/announcement.model.ts` — `Announcement`, `AnnouncementRecipient`, `AnnouncementCounts`, status unions, `AnnouncementRecipientInput`, `SendAnnouncementPayload`.
-- **Service** `services/announcements.service.ts` — `sendAnnouncement(payload)` (plain JSON), `getStoreAnnouncements`, `getAnnouncement`, `cancelScheduled`.
-- **NgRx** `state/announcements/announcements.{actions,reducer}.ts` — `setAnnouncements`/`addAnnouncement`(upsert)/`updateAnnouncementFields`(merge full doc)/`deleteAnnouncement`; registered in `app.reducer.ts`; selectors `selectAllAnnouncements`, `selectAnnouncementById(id)`.
-- **Socket** `services/web-socket.service.ts` — `announcementAdded`/`announcementUpdated`/`announcementDeleted` → dispatch NgRx (keeps the list live).
-- **Status styling** `announcements/announcement-status.util.ts` — `recipientStatus*` + `announcementStatus*` → Ionic colour/icon/i18n-key.
-- **Components** (under `app/announcements/`) — **reuse the email SCSS** via relative `styleUrls` since the markup uses the same class names:
-  - `announcements.component.*` — list bound to store + status filter + search (by title) + cancel; pulls latest via service on init.
-  - `announcement-item/*` — card: title, rollup badge, sent/failed/pending counts, scheduled-cancel button.
-  - `add-announcement/*` — compose: title/body, recipients (via `select-recipients` modal in `'announcement'` mode), schedule now/later, send.
-  - `announcement-details/*` — route `announcements/:id`; per-recipient pills (name + role + status); live via `selectAnnouncementById`.
-- **Reused + extended** `select-recipients/select-recipients.component.*`:
-  - new `@Input() mode: 'email' | 'sms' | 'announcement'`.
-  - `searchRecipients()` now attaches ids to each row: students `userId`+`studentId`; teachers `teacherId`+`userId`(cast, may be undefined); parents carry `userId`+`studentId` (the "parents-only" branch deliberately omits the **student row's** ids so the student is a non-selectable grouping header).
-  - selection now gates on **`canSelect(r)`** — announcement → `hasAccount` (userId/studentId/teacherId), else → has email. `selectedCount` / `setAllSelected` / the checkbox `[disabled]` / parent `*ngIf` all use it. Empty hint shows `recipients.no_account` in announcement mode, `recipients.no_email` otherwise.
-- **Routing** `app-routing.module.ts` — `announcements`, `announcements/add`, `announcements/:id` (`:id` AFTER `add`), `RoleGuard` + `roles: ['store-user']`.
-- **Home** `home/home.page.html` — card in the **Communication** section (`megaphone-outline`).
-- **i18n** `assets/i18n/{el,en}.json` — `announcements.*` (status, recipient_status, compose, cancel_*, …), `menu.communication.announcements`, `communication.announcements`, `general.add.announcement`, `general.search_by.title`, `recipients.no_account`, `no.announcements`.
+### Announcements feature
+- **Model** `models/announcement.model.ts`; **Service** `services/announcements.service.ts` (`sendAnnouncement`, `getStoreAnnouncements`, `getMyAnnouncements`, `getAnnouncement`, `cancelScheduled`).
+- **NgRx** `state/announcements/*` (registered in `app.reducer`; selectors `selectAllAnnouncements`, `selectAnnouncementById`). **Socket** `announcementAdded/Updated/Deleted` in `web-socket.service.ts`. **Status util** `announcements/announcement-status.util.ts`.
+- **Store-user components** (`app/announcements/`, reuse email SCSS via relative styleUrls): `announcements.component` (list), `announcement-item`, `add-announcement` (compose; recipients via `select-recipients` modal in `'announcement'` mode), `announcement-details`.
+- **Student inbox components**: `my-announcement-item` (standalone read-only card, `compact` input — own scss), `my-announcements` (page at `/my-announcements`). Home preview lives inline in `home.page.html` (`.announcements-preview-card`, styled in `home.page.scss`, data from `home.page.ts` → `getMyAnnouncements` → NgRx).
+- **Extended** `select-recipients.component.*`: `mode:'announcement'`; `searchRecipients()` attaches `studentId`/`teacherId`/`userId` (cleaned via `extractId`); selection gates on `canSelect(r)` (has-account vs has-email).
+- **Routing** `app-routing.module.ts`: `announcements`, `announcements/add`, `announcements/:id` (store-user); `my-announcements` (student). **i18n** `assets/i18n/{el,en}.json`.
+
+### Native push (Capacitor)
+- `capacitor.config.ts` — `appId com.frontistirio.app`, `webDir www`, `server.androidScheme:'http'` (dev), `PushNotifications.presentationOptions`.
+- `services/devices.service.ts` — thin HTTP to `/devices`.
+- `services/push.service.ts` — **no-op on web**; on native after login: `checkPermissions`/`requestPermissions` → `register()` → `registration` listener posts the FCM token to `/devices/register`; `pushNotificationReceived` → toast (foreground); `pushNotificationActionPerformed` → navigate `/home`; `removeAllListeners` + unregister on logout.
+- `app.component.ts` — `pushService.init()` after `webSocketService.connect()`; `pushService.unregister()` in `logout()`.
+- `android/` — committed native project; `google-services.json` in `android/app/` (package `com.frontistirio.app`); Google Services Gradle plugin **auto-applied** by Capacitor 6's conditional in `android/app/build.gradle`.
 
 ---
 
-## Files touched (Phase 1)
+## Files touched
 
-**Frontistirio-API (new):** `models/announcement.js`, `controllers/announcements.js`, `controllers/handlers/announcements.js`, `services/announcementDispatcher.js`, `jobs/announcementScheduler.js`, `routes/announcements.js`.
-**Frontistirio-API (edited):** `index.js`.
+**Frontistirio-API — new:** `models/announcement.js`, `models/deviceToken.js`, `controllers/announcements.js`, `controllers/devices.js`, `controllers/handlers/announcements.js`, `controllers/handlers/devices.js`, `services/announcementDispatcher.js`, `services/firebaseAdmin.js`, `services/pushDispatcher.js`, `jobs/announcementScheduler.js`, `routes/announcements.js`, `routes/devices.js`, `scripts/sendTestPush.js`.
+**Frontistirio-API — edited:** `index.js` (routes + watchers + CORS), `package.json` (firebase-admin), `.gitignore` (service-account key).
 
-**Frontistirio (new):** `models/announcement.model.ts`, `services/announcements.service.ts`, `state/announcements/announcements.actions.ts`, `state/announcements/announcements.reducer.ts`, `announcements/announcement-status.util.ts`, `announcements/announcements.component.{ts,html}`, `announcements/announcement-item/announcement-item.component.{ts,html}`, `announcements/add-announcement/add-announcement.component.{ts,html}`, `announcements/announcement-details/announcement-details.component.{ts,html}`.
-**Frontistirio (edited):** `state/app.reducer.ts`, `state/app.selectors.ts`, `services/web-socket.service.ts`, `select-recipients/select-recipients.component.{ts,html}`, `app-routing.module.ts`, `home/home.page.html`, `assets/i18n/el.json`, `assets/i18n/en.json`.
+**Frontistirio — new:** announcement model/service/state/status-util; components `announcements/{announcements,announcement-item,add-announcement,announcement-details,my-announcement-item,my-announcements}`; `services/{devices,push}.service.ts`; `capacitor.config.ts`; the whole `android/` project.
+**Frontistirio — edited:** `state/app.reducer.ts`, `state/app.selectors.ts`, `services/web-socket.service.ts`, `select-recipients/select-recipients.component.{ts,html}`, `app-routing.module.ts`, `home/home.page.{ts,html,scss}`, `home/home.module.ts`, `app.component.ts`, `assets/i18n/{el,en}.json`, `angular.json` (style budget), `environment.ts`, `android/app/src/main/AndroidManifest.xml` (+ debug manifest).
 
 ---
 
 ## Next steps / Εκκρεμότητες
 
-### 🟠 Phase 2 — push plumbing (code, no external accounts yet)
-- [ ] **`models/deviceToken.js`** — registry: `{ user → User, token (unique), platform: 'android'|'ios'|'web', store, lastSeenAt }`. Separate collection (not an array on `User`) → multi-device + easy cleanup of stale tokens.
-- [ ] **`routes/devices.js` + controller** — `POST /devices/register` (upsert by token, attach `user`+`store`), `POST /devices/unregister` (on logout). Auth, **any role**.
-- [ ] **`services/firebaseAdmin.js`** — lazy singleton init of `firebase-admin` from env (service-account JSON / `FIREBASE_*`). Add `firebase-admin` to `package.json`.
-- [ ] **`services/pushDispatcher.js`** — `sendToUsers(userIds, {title, body, data})`: load device tokens → `admin.messaging().sendEachForMulticast(...)` → return per-token results; delete tokens that come back `messaging/registration-token-not-registered`.
-- [ ] **Wire it into `dispatchAnnouncement`** — replace the Phase-1 stub loop with a `pushDispatcher` call, setting each recipient `sent`/`failed` from the result.
-- [ ] **Frontend Capacitor** — add `@capacitor/{core,cli,android,ios,push-notifications}`, `capacitor.config.ts`, `npx cap add android` / `ios`.
-- [ ] **Frontend `services/push.service.ts`** — native-only (no-op on web): after login, request permission → register → on `registration` send the token to `POST /devices/register`; handle `pushNotificationReceived` (foreground toast) + token refresh; unregister on logout. Call it from the same place that does `WebSocketService.connect()`.
+### 🔴 Before production
+- [ ] **`androidScheme` back to `https`** in `capacitor.config.ts` + point the native build at the **https** prod API — the `http` scheme was a local-dev workaround for mixed content.
+- [ ] **Fix the `passwordHash` leak** — the bootstrap populates `user_id` (and parents) without excluding secrets, shipping bcrypt hashes to the client. Exclude `passwordHash` from all user populates.
+- [ ] **iOS push** — Mac + Apple Developer, `npx cap add ios`, `GoogleService-Info.plist`, APNs auth key uploaded to Firebase, Push + Background-Modes capabilities, test on a physical device.
 
-### 🔴 Phase 3 — Firebase / APNs setup (user-provided, then wire)
-- [ ] **Firebase project** → `google-services.json` (android), `GoogleService-Info.plist` (ios), and a **service-account key** for the backend.
-- [ ] **iOS:** Apple Developer account, APNs auth key uploaded to Firebase, enable Push Notifications capability.
-- [ ] **Backend env:** point `firebase-admin` at the service-account; deploy.
-- [ ] **End-to-end test:** send an announcement → device receives the push (foreground + background); scheduled send fires once at `sendAt`.
+### 🟠 Robustness / scale
+- [ ] **Queue (BullMQ)** for scheduling/sending (retries + multi-instance) — shared with email.
+- [ ] **Live in-app delivery to recipients** — a *sanitized* socket event (no `recipients[]`) so the student home/list update without a refresh.
+- [ ] **Stale-token hygiene** beyond the `registration-token-not-registered` prune (e.g. `lastSeenAt` TTL).
 
-### 🟢 Enhancements (later)
-- [ ] **Recipient inbox** (if the "no inbox" decision is revisited): a `/announcements` view per recipient + read/unread tracking (would re-add a `read` field per recipient, like email's per-recipient status).
-- [ ] **Edit / resend** an announcement; **delete** from the list (soft-delete endpoint).
-- [ ] **Move scheduling/sending to a job queue (BullMQ)** for retries + multi-instance safety (shared with email).
-- [ ] **Audience preview / count** in compose before sending (how many accounts will actually be reached).
-- [ ] **Dynamic audience rule** option (store the rule, resolve at send time) as an alternative to the current snapshot.
+### 🟢 Enhancements
+- [ ] **Parent/teacher inbox** — the `/my-announcements` endpoint is already any-role; needs home/menu entry points for those roles (they currently have almost no UI).
+- [ ] **Read/unread tracking** per recipient (deliberately omitted so far).
+- [ ] **Edit / resend / delete** an announcement.
+- [ ] **Audience preview / count** in compose (how many accounts will actually be reached).
+- [ ] **Deep-link** a tapped push to a recipient announcement view (needs the inbox to expose a detail route).
 ```
