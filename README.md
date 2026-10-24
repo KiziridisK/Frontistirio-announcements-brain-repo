@@ -1,5 +1,11 @@
 # Frontistirio — Announcements Brain
 
+> **Κατάσταση τεκμηρίωσης** (σφραγίδα 2026-10-24) · τελευταία γραφή **2026-07-02**.
+> **Δεν φέρει επαλήθευση έναντι κώδικα** — κανόνας #4 του ευρετηρίου. Από εκείνη την ημερομηνία ο κώδικας
+> έχει προχωρήσει **134 commits** στο frontend και **49** στο API (όλο το repo, όχι μόνο αυτό το feature).
+> Σημερινά HEAD: frontend `0f466e0` / API `cabaa2c`.
+> Τι είναι **γνωστό** ότι λείπει: §5 και §5.1 του ευρετηρίου (`Frontistirio-brain-repos-index`).
+
 > **Full-stack reference** for the announcements feature: a store-user composes an **announcement**, picks an **audience** (teachers / students / parents, with **grade + class filters** exactly like the email feature), and sends it **now** or **schedules** it for later. The audience is **snapshotted to user accounts at send time** and delivered as a **native push notification** (Capacitor + Firebase/FCM) to the mobile app. Spans **Frontistirio-API** (Node/Express/MongoDB) and **Frontistirio** (Angular/Ionic/NgRx/Capacitor). Closely mirrors the [email-services](https://github.com/KiziridisK/Frontistirio-email-services-brain-repo) feature.
 
 > For the **build/emulator/Firebase setup procedure** (how the APK is built, how to run the Android emulator, how Firebase push was wired + every gotcha we hit), see the companion runbook: [Frontistirio-android-build-firebase-brain-repo](https://github.com/KiziridisK/Frontistirio-android-build-firebase-brain-repo).
